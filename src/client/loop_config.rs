@@ -15,5 +15,6 @@ pub(super) struct ClientLoopConfig {
     pub(super) endpoint_keybindings: bool,
     pub(super) remote_image_paste_key:
         Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+    pub(super) upload_policy: crate::config::ClientUploadPolicy,
     pub(super) shell_config: Option<shell::ClientShellConfig>,
 }

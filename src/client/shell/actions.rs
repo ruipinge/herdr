@@ -327,7 +327,7 @@ impl ClientShellState {
             code: code.into(),
         };
         let body = body.into();
-        if kind == ClientEndpointNoticeKind::Rejected {
+        if kind.dedupe_visible_only() {
             if self
                 .visible_endpoint_notice
                 .as_ref()
@@ -338,18 +338,28 @@ impl ClientShellState {
         } else if !self.endpoint_notice_seen.insert(key.clone()) {
             return false;
         }
-        let duration_seconds = if kind == ClientEndpointNoticeKind::Rejected {
-            3
-        } else {
-            8
-        };
         self.visible_endpoint_notice = Some(ClientVisibleEndpointNotice {
             key,
             title: title.into(),
             body,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(duration_seconds),
+            deadline: std::time::Instant::now() + kind.duration(),
         });
         true
+    }
+
+    pub(crate) fn receive_upload_notice(
+        &mut self,
+        notice: crate::client::uploads::UploadNotice,
+    ) -> bool {
+        use crate::client::uploads::UploadNoticeTone;
+        let kind = match notice.tone {
+            UploadNoticeTone::Progress => ClientEndpointNoticeKind::UploadProgress,
+            UploadNoticeTone::Done => ClientEndpointNoticeKind::UploadDone,
+            UploadNoticeTone::Failed => ClientEndpointNoticeKind::UploadFailed,
+        };
+        // Key on the title so consecutive notices with the same body still show.
+        let code = notice.title.clone();
+        self.push_endpoint_notice(kind, code, notice.title, notice.body)
     }
 
     pub(super) fn push_endpoint_method_with_kind(

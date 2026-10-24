@@ -34,6 +34,13 @@ pub fn config_dir() -> PathBuf {
     platform_config_dir()
 }
 
+pub fn cache_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
+        return PathBuf::from(dir).join(app_dir_name());
+    }
+    platform_cache_dir()
+}
+
 pub fn state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
         return PathBuf::from(dir).join(app_dir_name());
@@ -82,6 +89,20 @@ fn platform_state_dir() -> PathBuf {
         return PathBuf::from(home).join(format!(".local/state/{}", app_dir_name()));
     }
     std::env::temp_dir().join(format!("{}-state", app_dir_name()))
+}
+
+#[cfg(windows)]
+fn platform_cache_dir() -> PathBuf {
+    platform_state_dir().join("cache")
+}
+
+#[cfg(not(windows))]
+fn platform_cache_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(format!(".cache/{}", app_dir_name()))
+    } else {
+        std::env::temp_dir().join(format!("{}-cache", app_dir_name()))
+    }
 }
 
 #[cfg(not(windows))]

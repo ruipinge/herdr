@@ -33,6 +33,30 @@
           "type": "integer",
           "default": "40",
           "description": "Virtual terminal height used for layout and newly created panes when no client is attached. Must be greater than zero."
+        },
+        {
+          "key": "server.accept_uploads",
+          "type": "boolean",
+          "default": "false",
+          "description": "Accept non-image files that remote clients upload when files are dropped onto a pane. Image uploads are always accepted, up to 64 MiB per drop. Applies to new connections. Linux and macOS servers only; clients also need `remote.upload_extensions`."
+        },
+        {
+          "key": "server.upload_max_bytes",
+          "type": "integer",
+          "default": "268435456",
+          "description": "Largest drop this server stages, in bytes (256 MiB by default). The server keeps at most four times this amount of staged uploads in total."
+        },
+        {
+          "key": "server.upload_retention_hours",
+          "type": "integer",
+          "default": "24",
+          "description": "Hours staged uploads are kept. They survive detach and reattach and are removed at the next server start or upload once older than this; at least 1."
+        },
+        {
+          "key": "server.upload_dir",
+          "type": "path",
+          "default": "unset",
+          "description": "Directory for staged uploads. Defaults to the `uploads` folder in Herdr's cache directory, for example `~/.cache/herdr/uploads`. Use an absolute or `~` path. Each drop gets its own private folder inside it; nothing else there is touched."
         }
       ]
     },
@@ -1465,6 +1489,18 @@
           "type": "boolean",
           "default": "true",
           "description": "Add keepalive fallbacks and private connection reuse for `herdr --remote`. Set false to run plain ssh unchanged."
+        },
+        {
+          "key": "remote.upload_extensions",
+          "type": "list of strings",
+          "default": "[]",
+          "description": "File extensions, without the dot, uploaded when such files are dropped onto a pane of a remote server; the staged remote path is pasted instead of the local one. Images are always bridged. Use `\"*\"` for any regular file. Non-image files that are hidden or under a hidden directory such as `~/.ssh` are never uploaded. The server must set `server.accept_uploads = true`."
+        },
+        {
+          "key": "remote.upload_max_bytes",
+          "type": "integer",
+          "default": "104857600",
+          "description": "Largest file this client uploads, in bytes (100 MiB by default). Larger drops paste the local path with a notice."
         }
       ]
     },

@@ -7,12 +7,13 @@ mod sidebar;
 mod sound;
 mod tab_bar;
 mod theme;
+mod uploads;
 mod window_title;
 mod write;
 
 pub use self::{
     io::{
-        config_diagnostic_summary, config_dir, config_path, load_live_config,
+        cache_dir, config_diagnostic_summary, config_dir, config_path, load_live_config,
         remove_keybinding_config_sections, remove_section_key, state_dir, upsert_section_bool,
         upsert_section_value,
     },
@@ -51,6 +52,9 @@ pub(crate) use self::{
     window_title::{sanitize_window_title_text, window_title_diagnostics},
 };
 
+pub(crate) use self::uploads::{
+    is_image_file_name, ClientUploadDecision, ClientUploadPolicy, ServerUploadPolicy,
+};
 pub(crate) use self::{keybinds::CommandKeybindType, model::KeysConfig};
 
 pub const CONFIG_PATH_ENV_VAR: &str = "HERDR_CONFIG_PATH";
@@ -78,6 +82,9 @@ pub const DEFAULT_MOUSE_SCROLL_LINES: usize = 3;
 pub const DEFAULT_MOBILE_WIDTH_THRESHOLD: u16 = 64;
 pub const DEFAULT_HEADLESS_COLS: u16 = 120;
 pub const DEFAULT_HEADLESS_ROWS: u16 = 40;
+pub const DEFAULT_CLIENT_UPLOAD_MAX_BYTES: u64 = 100 * 1024 * 1024;
+pub const DEFAULT_SERVER_UPLOAD_MAX_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_UPLOAD_RETENTION_HOURS: u64 = 24;
 
 #[cfg(test)]
 pub(crate) fn app_dir_name() -> &'static str {
@@ -123,6 +130,7 @@ impl Config {
             .chain(window_title_diagnostics(&self.ui.window_title))
             .chain(self.invalid_sidebar_bounds_diagnostic())
             .chain(self.invalid_headless_size_diagnostic())
+            .chain(self.upload_diagnostics())
             .collect()
     }
 

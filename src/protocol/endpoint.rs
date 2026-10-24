@@ -31,6 +31,169 @@ pub const AGENT_VIEW_PROJECTION_CAPABILITY: &str = "agent_view_projection";
 pub const AGENT_VIEW_PROJECTION_KIND: &str = "endpoint.agent-view.v1";
 pub const AGENT_COMPLETIONS_CAPABILITY: &str = "agent_completions";
 pub const AGENT_COMPLETIONS_KIND: &str = "endpoint.agent-completions.v1";
+/// The server stages image uploads sent with the `endpoint.upload.*` controls.
+pub const UPLOAD_CAPABILITY: &str = "upload";
+/// The server owner also accepts uploads of non-image files.
+pub const UPLOAD_FILES_CAPABILITY: &str = "upload_files";
+pub const UPLOAD_BEGIN_KIND: &str = "endpoint.upload.begin.v1";
+pub const UPLOAD_CHUNK_KIND: &str = "endpoint.upload.chunk.v1";
+pub const UPLOAD_END_KIND: &str = "endpoint.upload.end.v1";
+pub const UPLOAD_CANCEL_KIND: &str = "endpoint.upload.cancel.v1";
+pub const UPLOAD_ACK_KIND: &str = "endpoint.upload.ack.v1";
+pub const UPLOAD_RESULT_KIND: &str = "endpoint.upload.result.v1";
+/// Raw bytes per upload chunk. Base64 keeps each control frame far below `MAX_FRAME_SIZE`,
+/// so keystrokes and health checks interleave with a transfer.
+pub const UPLOAD_CHUNK_BYTES: usize = 64 * 1024;
+/// Most files accepted in one upload batch.
+pub const UPLOAD_MAX_FILES: usize = 32;
+
+/// Starts one upload batch. Files are sent in order; their staged paths are pasted
+/// together into `target` once every file has arrived.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointUploadBegin {
+    pub id: u64,
+    pub target: EndpointUploadTarget,
+    pub files: Vec<EndpointUploadFile>,
+}
+
+/// Where the server pastes the staged paths. Independent of the frozen bincode
+/// `ClientClipboardImageTarget` so this JSON codec can grow without touching it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "RawEndpointUploadTarget", into = "RawEndpointUploadTarget")]
+pub enum EndpointUploadTarget {
+    Pane(String),
+    Popup(String),
+    DirectTerminal,
+    /// A target kind from a newer client; the server rejects the upload.
+    Unknown,
+}
+
+/// Wire form `{"kind": "...", "id": "..."}`, decoded leniently so unknown kinds and
+/// extra fields become `Unknown` instead of failing the whole control.
+#[derive(Serialize, Deserialize)]
+struct RawEndpointUploadTarget {
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+}
+
+impl From<RawEndpointUploadTarget> for EndpointUploadTarget {
+    fn from(raw: RawEndpointUploadTarget) -> Self {
+        match (raw.kind.as_str(), raw.id) {
+            ("pane", Some(id)) => Self::Pane(id),
+            ("popup", Some(id)) => Self::Popup(id),
+            ("direct_terminal", _) => Self::DirectTerminal,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+impl From<EndpointUploadTarget> for RawEndpointUploadTarget {
+    fn from(target: EndpointUploadTarget) -> Self {
+        let (kind, id) = match target {
+            EndpointUploadTarget::Pane(id) => ("pane", Some(id)),
+            EndpointUploadTarget::Popup(id) => ("popup", Some(id)),
+            EndpointUploadTarget::DirectTerminal => ("direct_terminal", None),
+            EndpointUploadTarget::Unknown => ("unknown", None),
+        };
+        Self {
+            kind: kind.into(),
+            id,
+        }
+    }
+}
+
+impl From<super::ClientClipboardImageTarget> for EndpointUploadTarget {
+    fn from(target: super::ClientClipboardImageTarget) -> Self {
+        match target {
+            super::ClientClipboardImageTarget::Pane(id) => Self::Pane(id),
+            super::ClientClipboardImageTarget::Popup(id) => Self::Popup(id),
+            super::ClientClipboardImageTarget::DirectTerminal => Self::DirectTerminal,
+        }
+    }
+}
+
+impl EndpointUploadTarget {
+    pub fn terminal_target(self) -> Option<super::ClientClipboardImageTarget> {
+        match self {
+            Self::Pane(id) => Some(super::ClientClipboardImageTarget::Pane(id)),
+            Self::Popup(id) => Some(super::ClientClipboardImageTarget::Popup(id)),
+            Self::DirectTerminal => Some(super::ClientClipboardImageTarget::DirectTerminal),
+            Self::Unknown => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointUploadFile {
+    /// Original file name without directories. The server sanitizes it.
+    pub name: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointUploadChunk {
+    pub id: u64,
+    /// Index into `EndpointUploadBegin::files`.
+    pub file: u32,
+    /// Byte offset of this chunk within the file.
+    pub offset: u64,
+    /// Standard base64 of at most `UPLOAD_CHUNK_BYTES` raw bytes.
+    pub data: String,
+}
+
+/// Sent by the client for `UPLOAD_END_KIND` and `UPLOAD_CANCEL_KIND`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointUploadId {
+    pub id: u64,
+}
+
+/// Flow-control credit: total bytes of the batch the server has written to disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointUploadAck {
+    pub id: u64,
+    pub received: u64,
+}
+
+/// Final outcome of a batch. On success `paths` holds the staged files on the server host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointUploadResult {
+    pub id: u64,
+    pub ok: bool,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Whether the paths were pasted into the target. False when the target went away.
+    #[serde(default)]
+    pub pasted: bool,
+    /// Machine-readable failure reason. Clients must tolerate unknown codes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl EndpointUploadResult {
+    pub fn failure(id: u64, code: &str, message: impl Into<String>) -> Self {
+        Self {
+            id,
+            ok: false,
+            paths: Vec::new(),
+            pasted: false,
+            code: Some(code.into()),
+            message: Some(message.into()),
+        }
+    }
+}
+
+pub fn upload_control_message<T: Serialize>(
+    kind: &str,
+    payload: &T,
+) -> serde_json::Result<ServerMessage> {
+    Ok(ServerMessage::EndpointControl {
+        kind: kind.into(),
+        data: serde_json::to_string(payload)?,
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointAgentCompletions {
@@ -177,6 +340,15 @@ impl EndpointServerWelcome {
             ],
             error: None,
         }
+    }
+
+    pub fn with_capabilities<'a>(
+        mut self,
+        capabilities: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        self.capabilities
+            .extend(capabilities.into_iter().map(str::to_owned));
+        self
     }
 
     pub fn incompatible(code: &str, message: impl Into<String>) -> Self {
@@ -407,6 +579,51 @@ mod tests {
         let mut value = hello();
         value.blob_codecs.clear();
         assert!(!value.supports_required_codecs());
+    }
+
+    #[test]
+    fn upload_controls_round_trip_and_tolerate_missing_optional_fields() {
+        let begin = EndpointUploadBegin {
+            id: 7,
+            target: EndpointUploadTarget::Pane("w1:p2".into()),
+            files: vec![EndpointUploadFile {
+                name: "report.pdf".into(),
+                size: 3,
+            }],
+        };
+        let encoded = serde_json::to_string(&begin).unwrap();
+        assert_eq!(
+            serde_json::from_str::<EndpointUploadBegin>(&encoded).unwrap(),
+            begin
+        );
+        assert!(encoded.contains(r#"{"kind":"pane","id":"w1:p2"}"#));
+        let future: EndpointUploadBegin =
+            serde_json::from_str(r#"{"id":1,"target":{"kind":"window","id":"x"},"files":[]}"#)
+                .unwrap();
+        assert_eq!(future.target, EndpointUploadTarget::Unknown);
+        let direct: EndpointUploadTarget =
+            serde_json::from_str(r#"{"kind":"direct_terminal"}"#).unwrap();
+        assert_eq!(direct, EndpointUploadTarget::DirectTerminal);
+        let result: EndpointUploadResult =
+            serde_json::from_str(r#"{"id":7,"ok":false,"future":1}"#).unwrap();
+        assert_eq!(result.code, None);
+        assert!(result.paths.is_empty());
+        assert!(!result.pasted);
+    }
+
+    #[test]
+    fn upload_chunks_stay_well_below_the_control_frame_limit() {
+        use base64::Engine as _;
+        let chunk = EndpointUploadChunk {
+            id: u64::MAX,
+            file: u32::MAX,
+            offset: u64::MAX,
+            data: base64::engine::general_purpose::STANDARD.encode(vec![0xff; UPLOAD_CHUNK_BYTES]),
+        };
+        let message = upload_control_message(UPLOAD_CHUNK_KIND, &chunk).unwrap();
+        let mut framed = Vec::new();
+        super::super::write_message(&mut framed, &message).unwrap();
+        assert!(framed.len() < super::super::MAX_FRAME_SIZE / 4);
     }
 
     #[test]
