@@ -215,14 +215,19 @@ fn write_batch(
     Ok(())
 }
 
-fn write_frame(
+fn write_frame(writer: &mut impl io::Write, frame: &[u8], stopped: &AtomicBool) -> io::Result<()> {
+    write_frame_with_timeout(writer, frame, stopped, WRITE_TIMEOUT)
+}
+
+/// The timeout bounds a stall, not the whole frame: a large frame over a slow SSH
+/// link may take longer than `timeout` to drain while still making progress.
+fn write_frame_with_timeout(
     writer: &mut impl io::Write,
     mut frame: &[u8],
     stopped: &AtomicBool,
+    timeout: Duration,
 ) -> io::Result<()> {
-    let deadline = Instant::now() + WRITE_TIMEOUT;
-    #[cfg(windows)]
-    let mut deadline = deadline;
+    let mut deadline = Instant::now() + timeout;
     while !frame.is_empty() && !stopped.load(Ordering::Acquire) {
         // Match interprocess's 512-byte pipe buffer hint: larger nonblocking Windows
         // writes can make no progress when the peer polls instead of blocking on read.
@@ -234,10 +239,7 @@ fn write_frame(
             Ok(0) => {}
             Ok(written) => {
                 frame = &frame[written..];
-                #[cfg(windows)]
-                {
-                    deadline = Instant::now() + WRITE_TIMEOUT;
-                }
+                deadline = Instant::now() + timeout;
                 continue;
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -434,6 +436,65 @@ mod tests {
         write_frame(&mut writer, b"first frame", &AtomicBool::new(false)).unwrap();
         write_frame(&mut writer, b"second frame", &AtomicBool::new(false)).unwrap();
         assert_eq!(writer.0, b"first framesecond frame");
+    }
+
+    #[test]
+    fn a_slow_frame_that_keeps_draining_outlives_the_stall_timeout() {
+        struct SlowWriter {
+            written: Vec<u8>,
+            last_progress: Instant,
+        }
+        impl io::Write for SlowWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if self.last_progress.elapsed() < Duration::from_millis(2) {
+                    return Err(io::ErrorKind::WouldBlock.into());
+                }
+                self.last_progress = Instant::now();
+                self.written.push(bytes[0]);
+                Ok(1)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = SlowWriter {
+            written: Vec::new(),
+            last_progress: Instant::now(),
+        };
+        // 200 bytes at one byte per 2 ms take ~400 ms, well past the 100 ms stall timeout,
+        // while each gap stays 50x below it so scheduler pauses cannot trip it.
+        let frame = vec![b'x'; 200];
+        let started = Instant::now();
+        write_frame_with_timeout(
+            &mut writer,
+            &frame,
+            &AtomicBool::new(false),
+            Duration::from_millis(100),
+        )
+        .expect("a frame making steady progress must not time out");
+        assert!(started.elapsed() > Duration::from_millis(100));
+        assert_eq!(writer.written, frame);
+    }
+
+    #[test]
+    fn a_frame_without_progress_times_out() {
+        struct StalledWriter;
+        impl io::Write for StalledWriter {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let error = write_frame_with_timeout(
+            &mut StalledWriter,
+            b"input",
+            &AtomicBool::new(false),
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]
