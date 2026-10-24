@@ -689,6 +689,31 @@ pub(super) enum ClientEndpointNoticeKind {
     Rejected,
     Timeout,
     Unavailable,
+    UploadProgress,
+    UploadDone,
+    UploadFailed,
+}
+
+impl ClientEndpointNoticeKind {
+    /// Kinds that can repeat in one session; others show once per server boot.
+    fn repeats(self) -> bool {
+        matches!(
+            self,
+            Self::Rejected | Self::UploadProgress | Self::UploadDone | Self::UploadFailed
+        )
+    }
+
+    pub(super) fn duration(self) -> std::time::Duration {
+        std::time::Duration::from_secs(match self {
+            Self::Rejected | Self::UploadDone => 3,
+            Self::UploadFailed => 6,
+            Self::Unsupported | Self::Timeout | Self::Unavailable | Self::UploadProgress => 8,
+        })
+    }
+
+    pub(super) fn dedupe_visible_only(self) -> bool {
+        self.repeats()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

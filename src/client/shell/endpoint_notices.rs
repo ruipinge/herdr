@@ -74,6 +74,9 @@ pub(super) fn render_notice(
             ClientEndpointNoticeKind::Timeout | ClientEndpointNoticeKind::Unavailable => {
                 palette.yellow
             }
+            ClientEndpointNoticeKind::UploadProgress => palette.blue,
+            ClientEndpointNoticeKind::UploadDone => palette.green,
+            ClientEndpointNoticeKind::UploadFailed => palette.red,
         },
         palette,
     )

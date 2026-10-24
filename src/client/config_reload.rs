@@ -21,6 +21,7 @@ pub(super) fn apply_reload(
         &mut state.remote_image_paste_key,
         &mut mouse_capture,
     );
+    reload_client_upload_policy(&mut state.uploads);
     state.shell_mouse_capture_preference = mouse_capture;
     state.direct_mouse_capture_preference = state.attach_escape.is_some() && mouse_capture;
     if state.shell.is_some() && previous_mouse_capture != mouse_capture {
@@ -88,6 +89,20 @@ pub(super) fn apply_reload(
         state.present_frame(frame);
     }
     Ok(())
+}
+
+fn reload_client_upload_policy(uploads: &mut super::uploads::ClientUploads) {
+    match crate::config::load_live_config() {
+        Ok(loaded)
+            if !loaded
+                .invalid_sections
+                .iter()
+                .any(|section| section == "remote") =>
+        {
+            uploads.set_policy(loaded.config.client_upload_policy());
+        }
+        Ok(_) | Err(_) => {}
+    }
 }
 
 pub(super) fn reload_local_client_config(

@@ -11,6 +11,8 @@ pub(crate) enum EndpointControlMessage {
     AgentViewProjection(DecodedAgentViewProjection),
     AgentCompletions(crate::protocol::endpoint::EndpointAgentCompletions),
     Snapshot(Box<crate::protocol::ClientShellSnapshot>),
+    UploadAck(crate::protocol::endpoint::EndpointUploadAck),
+    UploadResult(crate::protocol::endpoint::EndpointUploadResult),
     Ignored,
 }
 
@@ -20,6 +22,16 @@ pub(crate) fn decode_endpoint_control(
 ) -> Result<EndpointControlMessage, String> {
     if kind == crate::protocol::endpoint::HEALTH_PONG_KIND {
         return Ok(EndpointControlMessage::HealthPong);
+    }
+    if kind == crate::protocol::endpoint::UPLOAD_ACK_KIND {
+        return Ok(serde_json::from_str(data)
+            .map(EndpointControlMessage::UploadAck)
+            .unwrap_or(EndpointControlMessage::Ignored));
+    }
+    if kind == crate::protocol::endpoint::UPLOAD_RESULT_KIND {
+        return Ok(serde_json::from_str(data)
+            .map(EndpointControlMessage::UploadResult)
+            .unwrap_or(EndpointControlMessage::Ignored));
     }
     if kind == crate::protocol::endpoint::AGENT_COMPLETIONS_KIND {
         return Ok(serde_json::from_str(data)
@@ -74,6 +86,24 @@ pub(crate) fn protocol_failure_is_fatal(endpoint_id: &ClientEndpointId) -> bool 
 mod tests {
     use super::*;
     use crate::client::endpoint::ProfileId;
+
+    #[test]
+    fn upload_acks_and_results_decode_and_malformed_ones_are_ignored() {
+        use crate::protocol::endpoint::{UPLOAD_ACK_KIND, UPLOAD_RESULT_KIND};
+        assert!(matches!(
+            decode_endpoint_control(UPLOAD_ACK_KIND, r#"{"id":2,"received":9}"#).unwrap(),
+            EndpointControlMessage::UploadAck(ack) if ack.id == 2 && ack.received == 9
+        ));
+        assert!(matches!(
+            decode_endpoint_control(UPLOAD_RESULT_KIND, r#"{"id":2,"ok":true,"pasted":true}"#)
+                .unwrap(),
+            EndpointControlMessage::UploadResult(result) if result.ok && result.pasted
+        ));
+        assert!(matches!(
+            decode_endpoint_control(UPLOAD_ACK_KIND, "garbage").unwrap(),
+            EndpointControlMessage::Ignored
+        ));
+    }
 
     #[test]
     fn unknown_optional_controls_are_ignored() {

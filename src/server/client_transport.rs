@@ -448,6 +448,11 @@ pub(crate) enum ServerEvent {
         extension: String,
         data: Vec<u8>,
     },
+    /// A client finished uploading files; paste their staged paths into the target.
+    ClientUploadStaged {
+        client_id: u64,
+        upload: crate::server::uploads::StagedUpload,
+    },
     /// A client requested direct attach to one terminal.
     ClientAttachTerminal {
         client_id: u64,
@@ -828,12 +833,16 @@ pub(crate) fn handle_client_handshake(
         RenderEncoding::TerminalAnsi
     };
     let welcome = if shell_options.is_some() {
+        let upload_policy = crate::config::Config::load().config.server_upload_policy();
         let welcome = EndpointServerWelcome::compatible(
             crate::server::client_commands::supported_client_shell_method_names()
                 .iter()
                 .map(|method| (*method).to_owned())
                 .collect(),
-        );
+        )
+        .with_capabilities(crate::server::uploads::advertised_capabilities(
+            &upload_policy,
+        ));
         ServerMessage::EndpointControl {
             kind: ENDPOINT_WELCOME_KIND.into(),
             data: serde_json::to_string(&welcome).map_err(io::Error::other)?,
@@ -1006,6 +1015,8 @@ fn client_read_loop_with_endpoint_controls(
     should_quit: &Arc<AtomicBool>,
     endpoint_control_writer: Option<&ClientControlWriter>,
 ) -> io::Result<()> {
+    // Dropping the receiver when this loop ends discards any unfinished upload.
+    let mut uploads = crate::server::uploads::UploadReceiver::new(client_id);
     while !should_quit.load(Ordering::Acquire) {
         #[cfg(unix)]
         let message = protocol::read_message(
@@ -1344,6 +1355,29 @@ fn client_read_loop_with_endpoint_controls(
                 ServerEvent::ClientShellPresentationSync {
                     client_id,
                     token: data,
+                }
+            }
+            ClientMessage::EndpointControl { kind, data }
+                if endpoint_control_writer.is_some()
+                    && crate::server::uploads::is_upload_kind(&kind) =>
+            {
+                match uploads.handle(&kind, &data) {
+                    crate::server::uploads::UploadControlOutcome::Reply(response) => {
+                        let Some(writer) = endpoint_control_writer else {
+                            continue;
+                        };
+                        let mut framed = Vec::new();
+                        if protocol::write_message(&mut framed, &response).is_err()
+                            || writer.send(framed).is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    crate::server::uploads::UploadControlOutcome::Staged(upload) => {
+                        ServerEvent::ClientUploadStaged { client_id, upload }
+                    }
+                    crate::server::uploads::UploadControlOutcome::Ignore => continue,
                 }
             }
             ClientMessage::EndpointControl { kind, data } => {
@@ -2052,6 +2086,151 @@ mod tests {
             .join()
             .expect("handshake thread join")
             .expect("handshake thread result");
+    }
+
+    #[cfg(unix)] // Windows servers do not accept uploads yet.
+    #[test]
+    fn endpoint_uploads_are_advertised_staged_and_acked_by_the_reader_thread() {
+        use crate::protocol::endpoint::{
+            EndpointUploadAck, EndpointUploadBegin, EndpointUploadChunk, EndpointUploadFile,
+            EndpointUploadId, UPLOAD_ACK_KIND, UPLOAD_BEGIN_KIND, UPLOAD_CHUNK_KIND,
+            UPLOAD_END_KIND,
+        };
+        use base64::Engine as _;
+
+        let _env = crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "herdr-transport-upload-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let config_path = root.join("config.toml");
+        let upload_dir = root.join("uploads");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\naccept_uploads = true\nupload_dir = {:?}\n",
+                upload_dir.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        struct RestoreConfigPath(Option<std::ffi::OsString>);
+        impl Drop for RestoreConfigPath {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, value),
+                    None => std::env::remove_var(crate::config::CONFIG_PATH_ENV_VAR),
+                }
+            }
+        }
+        let _restore = RestoreConfigPath(std::env::var_os(crate::config::CONFIG_PATH_ENV_VAR));
+        std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &config_path);
+
+        let (mut client, server, _path) = local_stream_pair("endpoint-upload");
+        let (events, mut pending) = mpsc::channel(16);
+        let server_events = events.clone();
+        let quit = Arc::new(AtomicBool::new(false));
+        let server_quit = quit.clone();
+        let server_thread = std::thread::spawn(move || {
+            handle_client_handshake(server, 44, &server_events, &server_quit)
+        });
+        let mut reader = client.try_clone().unwrap();
+        let (messages, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(message) =
+                protocol::read_message::<_, ServerMessage>(&mut reader, MAX_FRAME_SIZE)
+            {
+                if messages.send(message).is_err() {
+                    break;
+                }
+            }
+        });
+        let next_control = |expected: &str| loop {
+            match received.recv_timeout(Duration::from_secs(2)).unwrap() {
+                ServerMessage::EndpointControl { kind, data } if kind == expected => break data,
+                _ => {}
+            }
+        };
+        let send = |client: &mut LocalStream, kind: &str, data: String| {
+            protocol::write_message(
+                client,
+                &ClientMessage::EndpointControl {
+                    kind: kind.into(),
+                    data,
+                },
+            )
+            .unwrap();
+        };
+
+        protocol::write_message(&mut client, &endpoint_hello(80, 29)).unwrap();
+        let welcome: EndpointServerWelcome =
+            serde_json::from_str(&next_control(ENDPOINT_WELCOME_KIND)).unwrap();
+        assert!(welcome
+            .capabilities
+            .iter()
+            .any(|capability| capability == crate::protocol::endpoint::UPLOAD_FILES_CAPABILITY));
+        let Some(ServerEvent::ClientShellConnected { writer, .. }) = pending.blocking_recv() else {
+            panic!("expected the shell client to register");
+        };
+
+        let begin = EndpointUploadBegin {
+            id: 5,
+            target: crate::protocol::endpoint::EndpointUploadTarget::Pane("w1:p1".into()),
+            files: vec![EndpointUploadFile {
+                name: "notes.pdf".into(),
+                size: 3,
+            }],
+        };
+        send(
+            &mut client,
+            UPLOAD_BEGIN_KIND,
+            serde_json::to_string(&begin).unwrap(),
+        );
+        let ack: EndpointUploadAck = serde_json::from_str(&next_control(UPLOAD_ACK_KIND)).unwrap();
+        assert_eq!((ack.id, ack.received), (5, 0));
+        let chunk = EndpointUploadChunk {
+            id: 5,
+            file: 0,
+            offset: 0,
+            data: base64::engine::general_purpose::STANDARD.encode(b"abc"),
+        };
+        send(
+            &mut client,
+            UPLOAD_CHUNK_KIND,
+            serde_json::to_string(&chunk).unwrap(),
+        );
+        let ack: EndpointUploadAck = serde_json::from_str(&next_control(UPLOAD_ACK_KIND)).unwrap();
+        assert_eq!(ack.received, 3);
+        send(
+            &mut client,
+            UPLOAD_END_KIND,
+            serde_json::to_string(&EndpointUploadId { id: 5 }).unwrap(),
+        );
+        let staged = loop {
+            match pending.blocking_recv() {
+                Some(ServerEvent::ClientUploadStaged { client_id, upload }) => {
+                    assert_eq!(client_id, 44);
+                    break upload;
+                }
+                Some(_) => {}
+                None => panic!("expected the staged upload event"),
+            }
+        };
+        assert_eq!(staged.paths.len(), 1);
+        assert!(staged.paths[0].starts_with(&upload_dir));
+        assert_eq!(std::fs::read(&staged.paths[0]).unwrap(), b"abc");
+
+        protocol::write_message(&mut client, &ClientMessage::Detach).unwrap();
+        server_thread.join().unwrap().unwrap();
+        quit.store(true, Ordering::Release);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

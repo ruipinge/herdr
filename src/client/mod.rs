@@ -19,6 +19,7 @@ mod clipboard_images;
 mod config_reload;
 #[cfg(unix)]
 mod direct_graphics;
+mod drop_paths;
 pub(crate) mod endpoint;
 mod endpoint_commands;
 mod errors;
@@ -40,6 +41,7 @@ mod terminal_sessions;
 mod terminal_setup;
 mod timer;
 mod transport;
+mod uploads;
 
 #[cfg(test)]
 use clipboard_forwarding::decode_clipboard_payload;
@@ -113,13 +115,13 @@ use attach::direct_attach_pixel_mouse;
 use attach::AttachEscapeState;
 #[cfg(unix)]
 use attach::{write_attach_semantic_action, AttachInputAction};
+#[cfg(windows)]
+use clipboard_images::should_bridge_clipboard_image_events;
+#[cfg(unix)]
+use clipboard_images::should_bridge_clipboard_image_paste;
 use clipboard_images::{
     client_remote_image_paste_key, endpoint_accepts_local_images, write_remote_image_to_server,
 };
-#[cfg(windows)]
-use clipboard_images::{read_image_file_from_client_events, should_bridge_clipboard_image_events};
-#[cfg(unix)]
-use clipboard_images::{read_image_file_from_terminal_drop, should_bridge_clipboard_image_paste};
 pub use errors::ClientError;
 #[cfg(test)]
 use frame_output::{clear_received_kitty_graphics, kitty_graphics_image_ids};
@@ -206,6 +208,7 @@ fn run_client_with_mode(
     let redraw_on_focus_gained = loaded_config.config.ui.redraw_on_focus_gained;
     let host_cursor = loaded_config.config.ui.host_cursor;
     let remote_image_paste_key = client_remote_image_paste_key(&loaded_config.config);
+    let upload_policy = loaded_config.config.client_upload_policy();
     let kitty_graphics_enabled =
         loaded_config.config.kitty_graphics_enabled() && client_rendered_shell;
     let pixel_geometry_enabled = kitty_graphics_enabled || attach_escape.is_some();
@@ -226,6 +229,7 @@ fn run_client_with_mode(
         initial_host_input: Vec::new(),
         endpoint_keybindings,
         remote_image_paste_key,
+        upload_policy,
         shell_config,
     };
 
@@ -485,6 +489,7 @@ async fn run_client_loop(
         #[cfg(unix)]
         mouse_scroll_lines: config.mouse_scroll_lines,
         remote_image_paste_key: config.remote_image_paste_key,
+        uploads: uploads::ClientUploads::new(config.upload_policy),
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
         presentation_frozen: false,
@@ -886,15 +891,15 @@ async fn run_client_loop(
                                 "clipboard image paste trigger received, but local clipboard has no image"
                             );
                         }
-                        if let Some(image) =
-                            read_image_file_from_terminal_drop(&data, image_bridge_active)
-                        {
-                            write_remote_image_to_server(
+                        if image_bridge_active
+                            && uploads::bridge_terminal_drop(
+                                &mut state,
                                 &mut write_stream,
                                 target,
-                                image,
-                                "file drop",
-                            )?;
+                                &data,
+                                now,
+                            )?
+                        {
                             continue;
                         }
                     }
@@ -1025,14 +1030,15 @@ async fn run_client_loop(
                         "clipboard image paste trigger received, but local clipboard has no image"
                     );
                 }
-                if let Some(image) = read_image_file_from_terminal_drop(&data, image_bridge_active)
-                {
-                    write_remote_image_to_server(
+                if image_bridge_active
+                    && uploads::bridge_terminal_drop(
+                        &mut state,
                         &mut write_stream,
                         crate::protocol::ClientClipboardImageTarget::DirectTerminal,
-                        image,
-                        "file drop",
-                    )?;
+                        &data,
+                        now,
+                    )?
+                {
                     continue;
                 }
                 let msg = ClientMessage::Input { data };
@@ -1211,15 +1217,15 @@ async fn run_client_loop(
                                 "clipboard image paste trigger received, but local clipboard has no image"
                             );
                         }
-                        if let Some(image) =
-                            read_image_file_from_client_events(&events, image_bridge_active)
-                        {
-                            write_remote_image_to_server(
+                        if image_bridge_active
+                            && uploads::bridge_client_events_drop(
+                                &mut state,
                                 &mut write_stream,
                                 target,
-                                image,
-                                "file drop",
-                            )?;
+                                &events,
+                                now,
+                            )?
+                        {
                             continue;
                         }
                     }
@@ -2114,6 +2120,26 @@ async fn run_client_loop(
                         }
                         let snapshot = match endpoint::decode_endpoint_control(&kind, &data) {
                             Ok(endpoint::EndpointControlMessage::HealthPong) => continue,
+                            Ok(endpoint::EndpointControlMessage::UploadAck(ack)) => {
+                                state.uploads.receive_ack(
+                                    &endpoint_id,
+                                    ack,
+                                    &mut write_stream,
+                                    now,
+                                );
+                                uploads::present_upload_notices(&mut state);
+                                continue;
+                            }
+                            Ok(endpoint::EndpointControlMessage::UploadResult(result)) => {
+                                state.uploads.receive_result(
+                                    &endpoint_id,
+                                    result,
+                                    &mut write_stream,
+                                    now,
+                                );
+                                uploads::present_upload_notices(&mut state);
+                                continue;
+                            }
                             Ok(endpoint::EndpointControlMessage::AgentViewProjection(
                                 projection,
                             )) => {
@@ -2264,6 +2290,10 @@ async fn run_client_loop(
                     .detached_process_children
                     .retain_mut(|child| child.try_wait().ok().flatten().is_none());
                 write_stream.tick_health(now);
+                if !state.uploads.is_idle() {
+                    state.uploads.tick(&mut write_stream, now);
+                    uploads::present_upload_notices(&mut state);
+                }
                 for failure in write_stream.take_failures() {
                     if write_stream.connection(&failure.endpoint_id).is_some()
                         && !write_stream.accepts(&failure.endpoint_id, failure.generation)

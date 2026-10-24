@@ -411,6 +411,9 @@ impl HeadlessServer {
     /// - Renders virtually and streams frames to clients
     pub async fn run(&mut self) -> io::Result<()> {
         crate::logging::startup("server");
+        if cfg!(unix) {
+            crate::server::uploads::sweep_at_startup();
+        }
 
         let server_stop = self.server_stop.clone();
         let quit_notify = self.server_event_tx.clone();
@@ -1165,12 +1168,20 @@ impl HeadlessServer {
         Ok(staged)
     }
 
+    /// Paste a staged path into the client's target. `claim_focus` promotes the client to
+    /// foreground and claims tab geometry, as a direct user action does; finished uploads
+    /// skip it because they can complete long after the drop, while another client is in use.
     fn paste_client_clipboard_image_path(
         &mut self,
         client_id: u64,
         target: protocol::ClientClipboardImageTarget,
         path: String,
-    ) -> bool {
+        claim_focus: bool,
+    ) -> ClientPasteOutcome {
+        let not_routed = ClientPasteOutcome {
+            changed: false,
+            pasted: false,
+        };
         match target {
             protocol::ClientClipboardImageTarget::DirectTerminal => {
                 let Some(ClientConnection {
@@ -1178,15 +1189,22 @@ impl HeadlessServer {
                     ..
                 }) = self.clients.get(&client_id)
                 else {
-                    return false;
+                    return not_routed;
                 };
+                let mut pasted = false;
                 if let Some(runtime) = self.runtime_for_terminal_id_string(terminal_id) {
                     let payload = paste_payload_for_runtime(runtime, &path);
-                    if let Err(err) = runtime.try_send_bytes(Bytes::from(payload)) {
-                        warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
+                    match runtime.try_send_bytes(Bytes::from(payload)) {
+                        Ok(()) => pasted = true,
+                        Err(err) => {
+                            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach clipboard image paste failed");
+                        }
                     }
                 }
-                true
+                ClientPasteOutcome {
+                    changed: true,
+                    pasted,
+                }
             }
             protocol::ClientClipboardImageTarget::Pane(pane_id) => {
                 if self.handoff_in_progress
@@ -1195,35 +1213,46 @@ impl HeadlessServer {
                         .get(&client_id)
                         .is_some_and(ClientConnection::is_active_shell_client)
                 {
-                    return false;
+                    return not_routed;
                 }
                 let Some((workspace_index, runtime_pane_id)) = self.app.parse_pane_id(&pane_id)
                 else {
-                    return false;
+                    return not_routed;
                 };
                 let popup_blocks_input = self.app.state.popup_pane.is_some()
                     && self.popup_owner_tab_id == self.shell_tab_id_for_client(client_id);
                 if popup_blocks_input
                     || !self.shell_client_views_pane(client_id, workspace_index, runtime_pane_id)
                 {
-                    return false;
+                    return not_routed;
                 }
-                let foreground_changed = self.promote_client_to_foreground(client_id);
-                let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
+                let focus_changed = claim_focus
+                    && (self.promote_client_to_foreground(client_id)
+                        | self.claim_shell_tab_geometry(client_id, false));
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
                     runtime_pane_id,
                 ) else {
-                    return foreground_changed | geometry_changed;
+                    return ClientPasteOutcome {
+                        changed: focus_changed,
+                        pasted: false,
+                    };
                 };
-                if let Err(err) = apply_client_pane_input_events(
+                let pasted = match apply_client_pane_input_events(
                     runtime,
                     &[protocol::ClientPaneInputEvent::Paste(path)],
                 ) {
-                    warn!(client_id, pane_id, err = %err, "client shell clipboard image paste failed");
+                    Ok(_) => true,
+                    Err(err) => {
+                        warn!(client_id, pane_id, err = %err, "client shell clipboard image paste failed");
+                        false
+                    }
+                };
+                ClientPasteOutcome {
+                    changed: true,
+                    pasted,
                 }
-                true
             }
             protocol::ClientClipboardImageTarget::Popup(terminal_id) => {
                 if self.handoff_in_progress
@@ -1232,7 +1261,7 @@ impl HeadlessServer {
                         .get(&client_id)
                         .is_some_and(ClientConnection::is_active_shell_client)
                 {
-                    return false;
+                    return not_routed;
                 }
                 let Some(popup_terminal_id) = self
                     .app
@@ -1241,25 +1270,36 @@ impl HeadlessServer {
                     .as_ref()
                     .map(|popup| popup.terminal_id.clone())
                 else {
-                    return false;
+                    return not_routed;
                 };
                 if popup_terminal_id.as_str() != terminal_id
                     || self.popup_owner_tab_id != self.shell_tab_id_for_client(client_id)
                 {
-                    return false;
+                    return not_routed;
                 }
-                let foreground_changed = self.promote_client_to_foreground(client_id);
-                let geometry_changed = self.claim_shell_tab_geometry(client_id, false);
+                let focus_changed = claim_focus
+                    && (self.promote_client_to_foreground(client_id)
+                        | self.claim_shell_tab_geometry(client_id, false));
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
-                    return foreground_changed | geometry_changed;
+                    return ClientPasteOutcome {
+                        changed: focus_changed,
+                        pasted: false,
+                    };
                 };
-                if let Err(err) = apply_client_popup_input_events(
+                let pasted = match apply_client_popup_input_events(
                     runtime,
                     &[protocol::ClientPaneInputEvent::Paste(path)],
                 ) {
-                    warn!(client_id, terminal_id, err = %err, "client shell popup clipboard image paste failed");
+                    Ok(_) => true,
+                    Err(err) => {
+                        warn!(client_id, terminal_id, err = %err, "client shell popup clipboard image paste failed");
+                        false
+                    }
+                };
+                ClientPasteOutcome {
+                    changed: true,
+                    pasted,
                 }
-                true
             }
         }
     }
@@ -2144,11 +2184,14 @@ impl HeadlessServer {
                 }
                 match self.stage_client_clipboard_image(client_id, &extension, &data) {
                     Ok(staged) => {
-                        let routed = self.paste_client_clipboard_image_path(
-                            client_id,
-                            target,
-                            staged.paste_text,
-                        );
+                        let routed = self
+                            .paste_client_clipboard_image_path(
+                                client_id,
+                                target,
+                                staged.paste_text,
+                                true,
+                            )
+                            .changed;
                         if routed {
                             if let Some(client) = self.clients.get_mut(&client_id) {
                                 client.staged_clipboard_files.push(staged.path);
@@ -2166,6 +2209,33 @@ impl HeadlessServer {
                         true
                     }
                 }
+            }
+            ServerEvent::ClientUploadStaged { client_id, upload } => {
+                let outcome =
+                    if self.client_clipboard_image_target_is_valid(client_id, &upload.target) {
+                        self.paste_client_clipboard_image_path(
+                            client_id,
+                            upload.target.clone(),
+                            upload.paste_text(),
+                            false,
+                        )
+                    } else {
+                        ClientPasteOutcome {
+                            changed: false,
+                            pasted: false,
+                        }
+                    };
+                let not_pasted_reason = (!outcome.pasted).then_some(if self.handoff_in_progress {
+                    "The server was restarting when the upload finished."
+                } else {
+                    "The target pane was no longer visible when the upload finished."
+                });
+                if let Some(message) = crate::server::uploads::result_message(
+                    &upload.result(outcome.pasted, not_pasted_reason),
+                ) {
+                    self.send_to_client(client_id, message);
+                }
+                outcome.changed
             }
             ServerEvent::ClientResize {
                 client_id,
@@ -3391,6 +3461,14 @@ fn client_pane_input_releases_press(event: &protocol::ClientPaneInputEvent) -> b
             ..
         }
     )
+}
+
+/// Result of pasting a staged path for a client.
+struct ClientPasteOutcome {
+    /// Server state changed (focus, geometry or pane input) and clients need a render.
+    changed: bool,
+    /// The path reached the target terminal.
+    pasted: bool,
 }
 
 fn client_pane_input_has_interaction(events: &[protocol::ClientPaneInputEvent]) -> bool {

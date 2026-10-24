@@ -2888,25 +2888,75 @@ async fn client_shell_input_targets_runtime_without_server_shell_classification(
     );
     assert_eq!(server.foreground_client_id, Some(11));
     let pane_id = server.app.session_snapshot().focused_pane_id.unwrap();
-    assert!(server.paste_client_clipboard_image_path(
-        11,
-        crate::protocol::ClientClipboardImageTarget::Pane(pane_id.clone()),
-        "/tmp/client-image.png".into(),
-    ));
+    assert!(
+        server
+            .paste_client_clipboard_image_path(
+                11,
+                crate::protocol::ClientClipboardImageTarget::Pane(pane_id.clone()),
+                "/tmp/client-image.png".into(),
+                true,
+            )
+            .changed
+    );
     assert_eq!(
         input_rx.try_recv().expect("targeted clipboard image path"),
         Bytes::from_static(b"/tmp/client-image.png")
     );
-    assert!(!server.paste_client_clipboard_image_path(
+    assert!(
+        !server
+            .paste_client_clipboard_image_path(
+                11,
+                crate::protocol::ClientClipboardImageTarget::DirectTerminal,
+                "/tmp/wrong-target.png".into(),
+                true,
+            )
+            .changed
+    );
+    assert!(
+        !server
+            .paste_client_clipboard_image_path(
+                11,
+                crate::protocol::ClientClipboardImageTarget::Popup("missing-popup".into()),
+                "/tmp/wrong-target.png".into(),
+                true,
+            )
+            .changed
+    );
+    assert!(input_rx.try_recv().is_err());
+
+    // A finished upload pastes without taking the foreground from the client in use.
+    server.clients.insert(
+        12,
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::ClientShell,
+            (80, 24),
+            crate::kitty_graphics::HostCellSize::default(),
+            1,
+            RenderEncoding::SemanticFrame,
+            None,
+        ),
+    );
+    server.foreground_client_id = Some(12);
+    server.handle_server_event(ServerEvent::ClientUploadStaged {
+        client_id: 11,
+        upload: crate::server::uploads::StagedUpload {
+            id: 1,
+            target: crate::protocol::ClientClipboardImageTarget::Pane(pane_id.clone()),
+            paths: vec!["/tmp/up/a.pdf".into(), "/tmp/up/b c.pdf".into()],
+        },
+    });
+    assert_eq!(
+        input_rx.try_recv().expect("staged upload paths"),
+        Bytes::from_static(b"/tmp/up/a.pdf '/tmp/up/b c.pdf'")
+    );
+    assert_eq!(server.foreground_client_id, Some(12));
+    let outcome = server.paste_client_clipboard_image_path(
         11,
         crate::protocol::ClientClipboardImageTarget::DirectTerminal,
-        "/tmp/wrong-target.png".into(),
-    ));
-    assert!(!server.paste_client_clipboard_image_path(
-        11,
-        crate::protocol::ClientClipboardImageTarget::Popup("missing-popup".into()),
-        "/tmp/wrong-target.png".into(),
-    ));
+        "/tmp/up/a.pdf".into(),
+        false,
+    );
+    assert!(!outcome.pasted && !outcome.changed);
     assert!(input_rx.try_recv().is_err());
 
     let (workspace_index, runtime_pane_id) = server
@@ -3086,20 +3136,30 @@ async fn client_shell_streams_and_targets_popup_terminal_content() {
         popup_input.try_recv().expect("popup input"),
         Bytes::from_static(b"typed")
     );
-    assert!(server.paste_client_clipboard_image_path(
-        12,
-        crate::protocol::ClientClipboardImageTarget::Popup(popup_terminal_id.to_string()),
-        "/tmp/popup-image.png".into(),
-    ));
+    assert!(
+        server
+            .paste_client_clipboard_image_path(
+                12,
+                crate::protocol::ClientClipboardImageTarget::Popup(popup_terminal_id.to_string()),
+                "/tmp/popup-image.png".into(),
+                true,
+            )
+            .changed
+    );
     assert_eq!(
         popup_input.try_recv().expect("popup clipboard image path"),
         Bytes::from_static(b"/tmp/popup-image.png")
     );
-    assert!(!server.paste_client_clipboard_image_path(
-        12,
-        crate::protocol::ClientClipboardImageTarget::Popup("stale-popup".into()),
-        "/tmp/wrong-popup.png".into(),
-    ));
+    assert!(
+        !server
+            .paste_client_clipboard_image_path(
+                12,
+                crate::protocol::ClientClipboardImageTarget::Popup("stale-popup".into()),
+                "/tmp/wrong-popup.png".into(),
+                true,
+            )
+            .changed
+    );
     assert!(popup_input.try_recv().is_err());
 
     assert!(

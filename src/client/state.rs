@@ -70,6 +70,7 @@ pub(super) struct ClientState {
     pub(super) mouse_scroll_lines: usize,
     pub(super) remote_image_paste_key:
         Option<(crossterm::event::KeyCode, crossterm::event::KeyModifiers)>,
+    pub(super) uploads: super::uploads::ClientUploads,
     pub(super) redraw_on_focus_gained: bool,
     pub(super) repaint_pending: bool,
     /// During a source-off-first handoff the currently blitted frame remains authoritative until
@@ -134,6 +135,7 @@ impl ClientState {
             #[cfg(unix)]
             mouse_scroll_lines: 3,
             remote_image_paste_key: None,
+            uploads: super::uploads::ClientUploads::new(Default::default()),
             redraw_on_focus_gained: false,
             repaint_pending: false,
             presentation_frozen: false,

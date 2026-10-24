@@ -1046,6 +1046,16 @@ pub struct ServerConfig {
     pub headless_cols: u16,
     /// Virtual terminal height used when no client is attached. Default: 40.
     pub headless_rows: u16,
+    /// Accept non-image files uploaded by remote clients. Image uploads are always
+    /// accepted, as with clipboard image paste. Default: false.
+    pub accept_uploads: bool,
+    /// Largest uploaded file this server stages. Default: 256 MiB.
+    pub upload_max_bytes: u64,
+    /// Hours staged uploads are kept before cleanup. Default: 24.
+    pub upload_retention_hours: u64,
+    /// Directory for staged uploads. Default: the Herdr cache directory's `uploads`
+    /// folder, for example `~/.cache/herdr/uploads`.
+    pub upload_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1062,12 +1072,20 @@ pub struct RemoteConfig {
     /// Add keepalive fallbacks and private connection reuse for `herdr --remote`.
     /// Set false to run plain ssh unchanged. Default: true.
     pub manage_ssh_config: bool,
+    /// File extensions (case-insensitive, without the dot) uploaded when such files are
+    /// dropped onto a pane of a remote server. Images are always bridged. `"*"` allows any
+    /// regular file. The server owner must also set `server.accept_uploads`. Default: [].
+    pub upload_extensions: Vec<String>,
+    /// Largest file this client uploads; larger drops paste the local path. Default: 100 MiB.
+    pub upload_max_bytes: u64,
 }
 
 impl Default for RemoteConfig {
     fn default() -> Self {
         Self {
             manage_ssh_config: true,
+            upload_extensions: Vec::new(),
+            upload_max_bytes: crate::config::DEFAULT_CLIENT_UPLOAD_MAX_BYTES,
         }
     }
 }
@@ -1318,6 +1336,10 @@ impl Default for ServerConfig {
             allow_unelevated_clients: false,
             headless_cols: crate::config::DEFAULT_HEADLESS_COLS,
             headless_rows: crate::config::DEFAULT_HEADLESS_ROWS,
+            accept_uploads: false,
+            upload_max_bytes: crate::config::DEFAULT_SERVER_UPLOAD_MAX_BYTES,
+            upload_retention_hours: crate::config::DEFAULT_UPLOAD_RETENTION_HOURS,
+            upload_dir: None,
         }
     }
 }

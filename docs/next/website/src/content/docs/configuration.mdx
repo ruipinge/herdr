@@ -121,6 +121,32 @@ manage_ssh_config = true
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your user and system SSH configs first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Linux and macOS clients also use a private per-attach OpenSSH control socket to reuse the first authenticated connection; Windows OpenSSH does not. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
+### Uploading dropped files
+
+Dropping image files onto a pane of a remote server copies them to that host and pastes the remote path. Other files need two opt-ins: the server owner allows uploads in the server's config, and your local config lists the extensions you want uploaded. Uploads work with Linux and macOS servers; Windows servers do not accept them yet.
+
+On the server:
+
+```toml
+[server]
+accept_uploads = true
+upload_max_bytes = 268435456  # 256 MiB per drop
+upload_retention_hours = 24
+# upload_dir = "~/.cache/herdr/uploads"
+```
+
+On the machine you attach from:
+
+```toml
+[remote]
+upload_extensions = ["pdf", "csv", "md", "json", "log", "zip"]  # or ["*"]
+upload_max_bytes = 104857600  # 100 MiB per file
+```
+
+Changes to `accept_uploads` apply to new connections, so reconnect after editing it. Without it, a server still accepts images, up to 64 MiB per drop. The server keeps at most four times `upload_max_bytes` of staged uploads in total. Staged uploads survive detach and reattach, and are removed at the next server start or upload once they are older than `upload_retention_hours`. Each drop gets its own private folder inside `upload_dir`; nothing else in that directory is touched. Set `upload_dir` to an absolute or `~` path.
+
+Herdr cannot tell a drop from pasting the same path as text, so pasting an absolute path to an allowed file also uploads it. Non-image files that are hidden or sit under a hidden directory such as `~/.ssh`, including through a symlink, are never uploaded. Uploads are sent in small pieces in the background, so you can keep typing; large uploads show progress in the top-right corner. Staged files keep a readable version of their name: spaces and other special characters become `_`. Several files dropped at once are pasted together, separated by spaces.
+
 ## Keybindings
 
 For a guided introduction to the prefix and a vetted prefix-free setup, see [Keyboard](/docs/keyboard/).
